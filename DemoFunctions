@@ -1,0 +1,425 @@
+CREATE TABLE std6_27.bills_table (
+	billnum int8 NULL,
+	billitem int8 NULL,
+	product int8 NULL,
+	qty int8 NULL,
+	netval numeric(17, 2) NULL,
+	tax numeric(17, 2) NULL,
+	rpa_sat numeric(17, 2) NULL,
+	plant bpchar(4) NULL,
+	calday date NULL
+)
+WITH (
+	appendonly=true,
+	orientation=column,
+	compresstype=zstd,
+	compresslevel=1
+)
+DISTRIBUTED BY (billnum)
+PARTITION BY RANGE(calday) 
+(
+	start (date '2020-11-01'::date)  
+	end (date '2022-11-01'::date)
+	every ('1 mon'::interval),
+	default partition others
+);
+
+CREATE OR REPLACE FUNCTION std6_27.f_full_load(p_table text, p_file_name text)
+	RETURNS int4
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+
+DECLARE
+	v_ext_table_name text;
+	v_sql text;	
+	v_gpfdist text;
+	v_result text;
+BEGIN
+	v_ext_table_name = p_table||'_ext';
+	
+	EXECUTE 'TRUNCATE TABLE '||p_table;
+
+	EXECUTE 'DROP EXTERNAL TABLE IF EXISTS '||v_ext_table_name;
+
+	v_gpfdist = 'gpfdist://172.16.128.202:8080/'||p_file_name||'.csv';
+
+	v_sql = 'CREATE EXTERNAL TABLE '||v_ext_table_name||'(LIKE '||p_table||')
+			LOCATION ('''||v_gpfdist||''')
+			FORMAT ''CSV'' (HEADER DELIMITER '','' NULL '''' ESCAPE ''"'' QUOTE ''"'')
+			ENCODING ''UTF8''';
+		
+	EXECUTE v_sql; 
+
+	EXECUTE 'INSERT INTO '||p_table||' SELECT * FROM '||v_ext_table_name;
+
+	EXECUTE 'SELECT COUNT(*) FROM '||p_table INTO  v_result;
+
+	RETURN v_result;
+END;
+
+
+$$
+EXECUTE ON ANY;
+
+CREATE OR REPLACE FUNCTION std6_27.f_load_data_mart()
+	RETURNS void
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+
+declare 
+	v_table_name text;
+	v_sql text;
+	v_return text;
+begin
+	drop table if exists std6_27.bills_data_mart;
+	create table std6_27.bills_data_mart(
+		plant varchar(10),
+		store varchar(50),
+		billnum varchar(10),
+		product varchar(10),
+		calday date,
+		qty int8,
+		rpa_sat int8,
+		disc int8
+	)
+	with (
+		appendonly=true,
+		orientation=column,
+		compresstype=zstd,
+		compresslevel=1
+	)
+	distributed by (billnum);
+	insert into std6_27.bills_data_mart
+	with promo as (
+				select 
+					c.plant
+					,c.calday
+					,c.billnum
+					,c.product
+					,max(pt.promo_type_id) p_type
+					,max(pt.discount) dis
+					,count() cnt
+				from coupons c
+				left join promos pt using(promo_id)
+				group by c.plant
+						,c.calday
+						,c.billnum
+						,c.product)
+		select 
+			plant
+			,store
+			,billnum
+			,product
+			,calday
+			,qty
+			,rpa_sat
+			,coalesce(case 
+				when p_type = 1 then dis * cnt
+				when p_type = 2 then dis * ((rpa_sat/qty)/100) * cnt
+			end, 0) disc
+			,disc_qty
+		from std6_27.bills_table bt 
+			left join promo p using(plant, calday, billnum, product)
+			left join std6_27.stores s on bt.plant = s.store;
+end;
+
+$$
+EXECUTE ON ANY;
+
+CREATE OR REPLACE FUNCTION std6_27.f_load_delta_partition_single(p_table text, p_start_date timestamp, p_end_date timestamp)
+	RETURNS void
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+	
+	
+declare
+	v_sql text;
+	v_format text;
+	v_ext_table text;
+	v_tmp_table text;
+	v_pxf_traffic text;
+	v_distr_key text;
+	v_params text;
+	v_load_interval interval;
+	v_start_date date;
+	v_end_date date;
+	v_table_oid int4;
+	v_where text;
+	v_cnt int8;
+	v_iterDateEnd date;
+	v_iterDateStart date;
+begin
+	v_ext_table = p_table||'_ext';
+	v_tmp_table = p_table||'_tmp';
+
+	SELECT c.oid
+	INTO v_table_oid
+	FROM pg_class AS c INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
+	WHERE n.nspname||'.'||c.relname = p_table
+	LIMIT 1;
+
+	IF v_table_oid = 0 OR v_table_oid IS NULL THEN
+		v_distr_key = 'DISTRIBUTED RANDOMLY';
+	ELSE
+		v_distr_key = pg_get_table_distributedby(v_table_oid);
+	END IF;
+
+	SELECT COALESCE('with (' || ARRAY_TO_STRING(reloptions, ', ') || ')','')
+	FROM pg_class
+	INTO v_params
+	WHERE oid = p_table::REGCLASS;
+
+	v_load_interval = '1 month'::interval;
+	v_start_date := DATE_TRUNC('month', p_start_date);
+	v_end_date := DATE_TRUNC('month', p_start_date) + v_load_interval;	
+
+--	v_where = p_partition_key||' >= '''||v_start_date||'''::date and  '||p_partition_key||' < '''||v_end_date||'''::date';
+
+	v_pxf_traffic = 'pxf://gp.traffic?PROFILE=Jdbc&JDBC_DRIVER=org.postgresql.Driver&DB_URL=jdbc:postgresql://192.168.214.212:5432/postgres&USER=intern&PASS=intern';
+	v_format = 'pxfwritable_import';			
+	
+	v_sql = 'DROP EXTERNAL TABLE IF EXISTS '||v_ext_table||';
+
+			CREATE EXTERNAL TABLE '|| v_ext_table ||'
+				(
+					plant bpchar(4),
+					"date" bpchar(10),
+					"time" bpchar(6),
+					frame_id bpchar(10),
+					quantity int4
+				)
+				location (
+					'''||v_pxf_traffic||'''
+				) on all 
+				format ''CUSTOM'' ( FORMATTER='''||v_format||''')
+				encoding ''UTF8'';';
+	
+	EXECUTE v_sql;
+			
+	LOOP
+		v_sql = 'DROP TABLE IF EXISTS '|| v_tmp_table ||';
+				CREATE TABLE '|| v_tmp_table ||' (LIKE '||p_table||') ' ||v_params||' '||v_distr_key||';';
+		EXECUTE v_sql;
+	
+		EXIT WHEN (v_iterDateEnd > p_end_date);	
+	
+		EXECUTE 'insert into '|| v_tmp_table ||'
+					select 
+						plant ,
+						to_date(date, ''DD-MM-YYYY'') calday,
+						time ,
+						frame_id ,
+						quantity
+					from '||v_ext_table||'
+					where to_date(date, ''DD-MM-YYYY'') >= '''||v_start_date||''' and to_date(date, ''DD-MM-YYYY'') < '''||v_end_date||''';';
+				
+		GET DIAGNOSTICS v_cnt = ROW_COUNT;
+		
+		RAISE NOTICE '%', v_start_date;
+		RAISE NOTICE '%', v_end_date;
+		RAISE NOTICE 'ROWS INSERTED: %', v_cnt;
+	
+		v_sql = 'ALTER TABLE '||p_table||' EXCHANGE PARTITION FOR (DATE '''||v_start_date||''') WITH TABLE '||v_tmp_table||' WITH VALIDATION';
+
+		EXECUTE v_sql;
+		
+		v_iterDateEnd = v_end_date + v_load_interval;
+		v_end_date = v_iterDateEnd; 
+		v_iterDateStart = v_start_date + v_load_interval;
+		v_start_date = v_iterDateStart;
+	
+	END LOOP;
+	
+	v_sql = 'DROP TABLE IF EXISTS '|| v_tmp_table ||';';
+		
+	EXECUTE v_sql;
+		
+end;
+$$
+EXECUTE ON ANY;
+
+CREATE OR REPLACE FUNCTION std6_27.f_load_delta_partition(p_table text, p_partition_key text, p_start_date timestamp, p_end_date timestamp)
+	RETURNS void
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+	
+DECLARE
+	v_sql text;
+	v_format text;
+	v_ext_table text;
+	v_tmp_table text;
+	v_pxf_head text;
+	v_pxf_item text;
+	v_distr_key text;
+	v_params text;
+	v_load_interval interval;
+	v_start_date date;
+	v_end_date date;
+	v_table_oid int4;
+	v_where text;
+	v_cnt int8;
+	v_iterDateEnd date;
+	v_iterDateStart date;
+BEGIN
+	v_ext_table = p_table||'_ext';
+	v_tmp_table = p_table||'_tmp';
+
+	SELECT c.oid
+	INTO v_table_oid
+	FROM pg_class AS c INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
+	WHERE n.nspname||'.'||c.relname = p_table
+	LIMIT 1;
+
+	IF v_table_oid = 0 OR v_table_oid IS NULL THEN
+		v_distr_key = 'DISTRIBUTED RANDOMLY';
+	ELSE
+		v_distr_key = pg_get_table_distributedby(v_table_oid);
+	END IF;
+
+	SELECT COALESCE('with (' || ARRAY_TO_STRING(reloptions, ', ') || ')','')
+	FROM pg_class
+	INTO v_params
+	WHERE oid = p_table::REGCLASS;
+
+	EXECUTE 'DROP TABLE IF EXISTS '||v_ext_table;
+	
+	PERFORM std6_27.f_create_partitions(p_table, p_end_date);
+	
+	v_load_interval = '1 month'::interval;
+	v_start_date := DATE_TRUNC('month', p_start_date);
+	v_end_date := DATE_TRUNC('month', p_start_date) + v_load_interval;	
+
+--	v_where = p_partition_key||' >= '''||v_start_date||'''::date and  '||p_partition_key||' < '''||v_end_date||'''::date';
+
+	v_pxf_head = 'pxf://gp.bills_head?PROFILE=Jdbc&JDBC_DRIVER=org.postgresql.Driver&DB_URL=jdbc:postgresql://192.168.214.212:5432/postgres&USER=intern&PASS=intern';
+	v_pxf_item = 'pxf://gp.bills_item?PROFILE=Jdbc&JDBC_DRIVER=org.postgresql.Driver&DB_URL=jdbc:postgresql://192.168.214.212:5432/postgres&USER=intern&PASS=intern';
+	v_format = 'pxfwritable_import';			
+	
+	drop external table if exists std6_27.bills_head_ext;
+	drop external table if exists std6_27.bills_item_ext;
+
+	EXECUTE  'create external table std6_27.bills_head_ext
+				(
+					billnum int8,
+					plant bpchar(4),
+					calday date
+				)
+				location (
+					'''||v_pxf_head||'''
+				) on all 
+				format ''CUSTOM'' ( FORMATTER='''||v_format||''')
+				encoding ''UTF8'';';
+			
+	EXECUTE	'create external table std6_27.bills_item_ext
+				(
+					billnum int8,
+					billitem int8,
+					material int8,
+					qty int8,
+					netval numeric(17, 2),
+					tax numeric(17, 2),
+					rpa_sat numeric(17, 2),
+					calday date
+				)
+				location (
+					'''||v_pxf_item||'''
+				) on all 
+				format ''CUSTOM'' ( FORMATTER='''||v_format||''')
+				encoding ''UTF8'';';
+			
+	LOOP
+		v_sql = 'DROP TABLE IF EXISTS '|| v_tmp_table ||';
+				CREATE TABLE '|| v_tmp_table ||' (LIKE '||p_table||') ' ||v_params||' '||v_distr_key||';';
+		
+		EXIT WHEN (v_iterDateEnd > p_end_date);	
+	
+		EXECUTE v_sql;
+	
+		EXECUTE 'insert into '|| v_tmp_table ||'
+					select 
+						bie.billnum 
+						,bie.billitem 
+						,bie.material product
+						,bie.qty 
+						,bie.netval 
+						,bie.tax 
+						,bie.rpa_sat
+						,bhe.plant
+						,bie.calday
+					from std6_27.bills_item_ext bie
+						left join std6_27.bills_head_ext bhe
+							on bie.billnum = bhe.billnum
+					where bie.calday >= '''||v_start_date||''' and bie.calday < '''||v_end_date||''';';
+				
+		GET DIAGNOSTICS v_cnt = ROW_COUNT;
+		
+		RAISE NOTICE '%', v_start_date;
+		RAISE NOTICE '%', v_end_date;
+		RAISE NOTICE 'ROWS INSERTED: %', v_cnt;
+	
+		v_sql = 'ALTER TABLE '||p_table||' EXCHANGE PARTITION FOR (DATE '''||v_start_date||''') WITH TABLE '||v_tmp_table||' WITH VALIDATION';
+
+		EXECUTE v_sql;
+		
+		v_iterDateEnd = v_end_date + v_load_interval;
+		v_end_date = v_iterDateEnd; 
+		v_iterDateStart = v_start_date + v_load_interval;
+		v_start_date = v_iterDateStart;
+	
+	END LOOP;	
+		
+	v_sql = 'DROP TABLE IF EXISTS '|| v_tmp_table ||';';
+	
+	EXECUTE v_sql;
+
+END;
+
+
+$$
+EXECUTE ON ANY;
+
+
+
+CREATE OR REPLACE FUNCTION std6_27.f_create_partitions(p_table_name text, p_partition_value timestamp)
+	RETURNS void
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+		
+DECLARE
+	v_cnt_partitions int;
+	v_table_name text;
+	v_partition_end_sql text;
+	v_partition_end timestamp;
+	v_interval interval;
+	v_ts_format text = 'YYYY-MM-DD HH24:MI:SS';
+BEGIN
+
+	RAISE NOTICE 'START';
+	SELECT COUNT(*) INTO v_cnt_partitions FROM pg_partitions p WHERE p.schemaname||'.'||p.tablename = lower(p_table_name);
+	IF v_cnt_partitions > 1 THEN
+		LOOP	
+			SELECT partitionrangeend INTO v_partition_end_sql
+				FROM(
+					SELECT p.*, RANK() OVER (ORDER BY partitionrank DESC) rnk FROM pg_partitions p
+					WHERE p.partitionrank IS NOT NULL AND p.schemaname||'.'||p.tablename = lower(p_table_name)
+				) q
+				WHERE rnk = 1;
+			EXECUTE 'SELECT '||v_partition_end_sql INTO v_partition_end;
+			EXIT WHEN v_partition_end > p_partition_value;
+			v_interval = '1 month'::interval;
+			EXECUTE 'ALTER TABLE '||p_table_name||' SPLIT DEFAULT PARTITION START ('||v_partition_end_sql||') END ('''||to_char(v_partition_end+v_interval, v_ts_format)||'''::timestamp)';
+		END LOOP;
+	END IF;
+	RAISE NOTICE 'END';
+END;
+
+$$
+EXECUTE ON ANY;
