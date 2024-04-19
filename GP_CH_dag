@@ -1,0 +1,99 @@
+from airflow import DAG 
+from datetime import datetime, timedelta, date
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.python_operator import PythonOperator
+from clickhouse_driver import Client
+
+
+default_args = {
+    'depends_on_past': False,
+    'owner': 'std4_7',
+    'start_date': datetime(2023, 12, 17),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5)
+}
+with DAG(
+    "clickhouse_sql_dag_4_7",
+    max_active_runs=3,
+    schedule_interval=None,
+    default_args=default_args,
+    catchup=False,
+) as dag:
+
+    task_start = DummyOperator(task_id="start")
+    
+    def execute_clickhouse_query():
+    # Параметры подключения к ClickHouse
+        host = '192.168.214.206'
+        port = '9000'
+        user = 'std4_7'
+        password = 'AKaJHpQtTSJq'
+        database = 'std4_7'
+    # Создаем клиент ClickHouse
+        client = Client(host=host, port=port, user=user, password=password, database=database)
+    # Выполняем запрос
+        result = client.execute("INSERT INTO std4_7.ch_final_total_mart_temp SELECT * FROM std4_7.ch_final_delta_mart_ext")
+     
+    execute_query = PythonOperator(
+                        task_id='execute_query',
+                        python_callable=execute_clickhouse_query,
+                        dag=dag
+                        )
+
+    task_end = DummyOperator(task_id='end')
+
+
+task_start >> execute_query >> task_end
+
+
+from airflow import DAG
+from datetime import datetime, timedelta, date
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.postgres_operator import PostgresOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.utils.task_group import TaskGroup
+
+
+LOAD_PXF = "select std6_27.f_load_delta_partition('std6_27.bills_table', '2021-01-01', '2021-03-01')"
+DB_SCHEMA = 'std6_27'
+DB_PROC_LOAD = 'f_full_load'
+FULL_LOAD_TABLES = ['coupons', 'promos', 'promos_type', 'stores']
+FULL_LOAD_FILES = {'coupons':'coupons', 'promos':'promos', 'promos_type':'promos_type', 'stores':'stores'}
+MD_TABLE_LOAD_QUERY = f"select {DB_SCHEMA}.{DB_PROC_LOAD}(%(tab_name)s, %(file_name)s);"
+CALC_DATA_MART = "select std6_27.f_load_data_mart('2021-01-01', '2021-02-28')"
+DB_CONN = "gp_std6_27"
+default_args = {
+    'depends_on_past': False,
+    'owner': 'std6_27',
+    'start_date': datetime(2023, 5, 1),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5)
+}
+with DAG(
+    "task_dag_std6_27",
+    max_active_runs=3,
+    schedule_interval=None,
+    default_args=default_args,
+    catchup=False,
+) as dag:
+    
+    task_start = DummyOperator(task_id="start")
+    
+    task_1 = PostgresOperator(task_id="start_insert_fact",
+                                 postgres_conn_id="gp_std6_27",
+                                 sql=LOAD_PXF)
+    
+    with TaskGroup("full_insert") as task_full_insert_tables:
+        for table in FULL_LOAD_TABLES:
+            task = PostgresOperator(task_id = f"load_table_{table}",
+                                    postgres_conn_id = DB_CONN,
+                                    sql = MD_TABLE_LOAD_QUERY,
+                                    parameters = {'tab_name':f'{DB_SCHEMA}.{table}', 'file_name':f'{FULL_LOAD_FILES[table]}'})
+    
+    task_3 = PostgresOperator(task_id="start_calc_data_mart",
+                                 postgres_conn_id="gp_std6_27",
+                                 sql=CALC_DATA_MART)  
+
+    task_end = DummyOperator(task_id="end")
+    
+    task_start >> task_1 >> task_full_insert_tables >> task_3 >> task_end
