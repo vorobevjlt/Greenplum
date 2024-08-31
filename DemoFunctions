@@ -35,7 +35,7 @@ DECLARE
 	v_ext_table_name text;
 	v_sql text;	
 	v_gpfdist text;
-	v_result text;
+	v_result int4;
 BEGIN
 	v_ext_table_name = p_table||'_ext';
 	
@@ -54,7 +54,7 @@ BEGIN
 
 	EXECUTE 'INSERT INTO '||p_table||' SELECT * FROM '||v_ext_table_name;
 
-	EXECUTE 'SELECT COUNT(*) FROM '||p_table INTO  v_result;
+	EXECUTE 'SELECT COUNT(*) FROM '||p_table||' INTO v_result;
 
 	RETURN v_result;
 END;
